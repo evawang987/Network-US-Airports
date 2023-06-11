@@ -1,0 +1,466 @@
+---
+title: "Team 6 Network Final Project: US Airports"
+author: "Team 6: Jack Chu, Xijia Yuan, & Eva Wang"
+date: "2023-05-03"
+format:
+  html:
+    theme: united
+    toc: true
+    toc-location: left
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+setwd("~/Documents/Mod 4/Networks Theory and Analysis/Final Project/")
+```
+
+
+```{r, message=FALSE}
+library(plyr)
+library(tidyr)
+library(dplyr)
+library(tidyverse)
+library(sqldf)
+library(openxlsx)
+library(stringr)
+
+library(ggraph)
+library(ggplot2)
+library(ggcorrplot)
+library(mapview)
+library(ggnetwork)
+
+library(sna)
+library(igraph) 
+library(igraphdata)
+library(network)
+
+library(statnet)
+library(btergm)
+library(lme4)
+library(lmerTest)
+library(performance)
+```
+
+# Import Data
+
+```{r}
+data("USairports", package = "igraphdata")
+nl <- get.data.frame(USairports, what = "vertices")
+el <- get.data.frame(USairports, what = "edges")
+el$logical <- which_loop(USairports)
+el <- el[el$logical==FALSE,]
+```
+
+## Data Prep for ERGM
+
+```{r}
+new_edges <- el %>% 
+  group_by(from, to) %>% 
+  summarize(Sum_Distance=sum(Distance), Real_Distance=mean(Distance))
+
+
+new_edges_1 <- el %>% 
+  group_by(from) %>% 
+  summarize(Sum_Passengers = sum(Passengers), Sum_Seats = sum(Seats), Sum_Depart=sum(Departures))
+
+names(new_edges_1)[1] <- "name"
+
+new_nodes <- merge(nl, new_edges_1, by="name", all.x = TRUE)
+
+new_nodes[is.na(new_nodes)] <- 0
+
+new_nodes$Sum_Passengers_scale <- scale(new_nodes$Sum_Passengers)[, 1]
+
+new_nodes$Sum_Depart_scale <- scale(new_nodes$Sum_Depart)[, 1]
+
+net_sna <- network(new_edges, matrix.type = "edgelist", 
+                   directed = T, vertex.attr = new_nodes)
+
+net_sna
+
+
+un_net <- igraph::graph_from_data_frame(new_edges, directed = F, new_nodes)
+new_edges$dup <- igraph::which_multiple(un_net)
+new_edges2 <- new_edges %>% filter(dup == FALSE)
+un_net_sna <- network(new_edges2, matrix.type = "edgelist",
+                   directed = F, vertex.attr = new_nodes)
+un_net_sna 
+
+
+net <- graph_from_data_frame(el, directed = T, vertices = nl)
+new_net <- graph_from_data_frame(new_edges, directed = T, vertices = new_nodes)
+```
+
+## Data Cleaning for MLM
+
+```{r carrier region}
+region <- read.xlsx("region.xlsx")
+
+el2 <- merge(el, region, by = "Carrier")
+el2 <- el2[,-9]
+
+colnames(el2)[9:10] <- c("Carrier_Country", "Carrier_USstate")
+```
+
+```{r from & to}
+city_split <- strsplit(nl$City, ",")
+airport_code_location <- purrr::map_df(1:length(city_split), ~{
+  data.frame(Code = nl$name[.x],
+             Location = gsub(" ", "", city_split[[.x]][2]))
+})
+
+# Convert abb to names
+state_code <- read.csv("state.csv")
+airport_code_location$Name <- 
+  ifelse(airport_code_location$Location %in% state_code$Code, state_code$State, 
+         ifelse(airport_code_location$Location == "PR", "Puerto Rico",
+                ifelse(airport_code_location$Location == "TT","Trinidad and Tobago",
+                       ifelse(airport_code_location$Location == "VI", "U.S. Virgin Islands", NA))))
+# airport_code_location[is.na(airport_code_location$Name),] # check
+
+# merge w/el2
+from_region <- merge(el2, airport_code_location, 
+                     by.x = "from", by.y = "Code",)
+el2$from_region <- from_region$Name
+
+to_region <- merge(el2, airport_code_location, 
+                     by.x = "to", by.y = "Code",)
+el2$to_region <- to_region$Name
+
+#write.csv(el2, "Final_el.csv", row.names = FALSE)
+```
+
+# Visualization
+
+## Network Overall
+
+```{r}
+ggraph(net) + 
+  geom_edge_link0(width = 0.05, alpha = .3) + 
+  geom_node_point(size = 0.35) +
+  ggnetwork::theme_blank()
+
+
+airports <- read.csv('https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat', header = F)
+# head(airports)
+
+V(USairports)$lat=airports[match(V(USairports)$name, airports[,5]), 7] 
+V(USairports)$long=airports[match(V(USairports)$name, airports[,5]), 8]
+
+#remove loops and make undirected
+usair <- as.undirected(simplify(USairports))
+
+#remove airports whose codes didn't match the OpenFlights database (and hence returned "NA" for latitude)
+usair <- delete.vertices(usair, which(is.na(V(usair)$lat)==TRUE))
+
+#remove nodes in the Eastern and Southern Hemispheres (US territories). This will make the plot easier to see.
+usair <- delete.vertices(usair, which(V(usair)$lat<0))
+usair <- delete.vertices(usair, which(V(usair)$long>0))
+
+#keep only the largest connected component of the network ("giant component"). this also makes the network easier to see.
+decomp <- decompose.graph(usair)
+usair <- decomp[[1]]
+
+longlat=matrix(c(V(usair)$long, V(usair)$lat), ncol=2) #set up layout matrix 
+par(mar=c(1,1,1,1))
+plot(usair, layout=longlat, vertex.label="", vertex.size = 2)
+```
+
+## Visualization for locations
+
+```{r}
+# arrival airport
+count <- table(el2$to_region)
+to_region_viz <- data.frame(state = names(count),
+                            count = as.numeric(count))
+
+states <- read.csv("location.csv") # geocode lat and long for state and US territory
+to_map_data <- merge(to_region_viz, states, 
+                  by.x = "state", by.y = "STNAME")
+
+pal = mapviewPalette("mapviewTopoColors")
+
+mapview()+
+  mapview(to_map_data, 
+          xcol = "LONGITUDE", ycol = "LATITUDE", zcol = "count",
+          cex = "count", 
+          label = paste(to_map_data$state, ":", to_map_data$count),
+          layer.name = c("# Arrival"),
+          col.regions = pal(100), at = seq(min(to_map_data$count), max(to_map_data$count), 250),
+          grid = FALSE, alpha = 1)
+```
+
+
+```{r}
+# departure airport
+countd <- table(el2$from_region)
+from_region <- data.frame(state = names(countd),
+                            count = as.numeric(countd))
+
+states <- read.csv("location.csv") # geocode lat and long for state and US territory
+from_map <- merge(from_region, states, 
+                  by.x = "state", by.y = "STNAME")
+
+mapview()+
+  mapview(from_map, 
+          xcol = "LONGITUDE", ycol = "LATITUDE", zcol = "count",
+          cex = "count", 
+          label = paste(from_map$state, ":", from_map$count),
+          layer.name = c("# Depature"),
+          col.regions = pal(100), at = seq(min(from_map$count), max(from_map$count), 250),
+          grid = FALSE, alpha = 1)
+```
+
+```{r}
+# Carrier location
+
+counts <- table(el2$Carrier_USstate)
+carrier_data <- data.frame(state = names(counts),
+                          num = as.numeric(counts))
+carrier_viz <- merge(carrier_data, states,
+                     by.x = "state", by.y = "STNAME")
+
+mapview()+
+  mapview(carrier_viz, 
+          xcol = "LONGITUDE", ycol = "LATITUDE", zcol = "num",
+          cex = "num", 
+          label = paste(carrier_viz$state, ":", carrier_viz$num),
+          layer.name = c("# of carriers"),
+          col.regions = pal(100), at = seq(min(carrier_viz$num), max(carrier_viz$num), 935),
+          grid = FALSE, alpha = 1)
+```
+
+# Centrality
+
+## Degree
+```{r}
+ggraph(net) + 
+  geom_edge_link0(width = 0.05, color = "black", alpha = .3) +
+  geom_node_point(fill = "green", color = "black", shape = 21, 
+                  size = V(net)$size <- igraph::degree(net, mode = "all") / 300) +
+  ggnetwork::theme_blank()
+
+airport_deg <- as.data.frame(igraph::degree(net, mode = "all"))
+names(airport_deg)[1] <- "degree"
+airport_deg$airport <- row.names(airport_deg)
+head(airport_deg[order(airport_deg$degree, decreasing = T),],5)
+```
+
+## Closeness
+```{r}
+comp_s <- igraph::components(net, mode = "strong")
+
+max_comp <- which.max(comp_s$csize)
+
+big_comp <- induced.subgraph(net, which(comp_s$membership == max_comp)) #subset the data to only include the largest connected component
+big_comp
+
+ggraph(net) + 
+  geom_edge_link0(width = 0.05, color = "black", alpha = .3, 
+                  arrow = grid::arrow(angle = 7.5,
+                                      length = unit(0.08, "in"),
+                                      type = "closed"), 
+                  start_cap = circle(2, 'mm'),
+                  end_cap = circle(2, 'mm')) +
+  geom_node_point(fill = "gold", color = "black", shape = 21, 
+                  size = igraph::closeness(net)*10) +
+  ggnetwork::theme_blank()
+
+ggraph(big_comp) + 
+  geom_edge_link0(width = 0.05, color = "black", alpha = .3, 
+                  arrow = grid::arrow(angle = 7.5,
+                                      length = unit(0.08, "in"),
+                                      type = "closed"), 
+                  start_cap = circle(2, 'mm'),
+                  end_cap = circle(2, 'mm')) +
+  geom_node_point(fill = "gold", color = "black", shape = 21, 
+                  size = igraph::closeness(big_comp)*5000) +
+  ggnetwork::theme_blank()
+
+airport_clo <- as.data.frame(igraph::closeness(big_comp))
+names(airport_clo)[1] <- "closeness"
+airport_clo$airport <- row.names(airport_clo)
+head(airport_clo[order(airport_clo$closeness, decreasing = T),],10)
+```
+
+## Betweeness
+```{r}
+ggraph(net) + 
+  geom_edge_link(width = 0.05, color = "black", alpha = .3, 
+                  arrow = grid::arrow(angle = 10,
+                                      length = unit(0.08, "in"),
+                                      type = "closed"),
+                  start_cap = circle(2, 'mm'),
+                  end_cap = circle(2, 'mm')) +
+  geom_node_point(fill = "pink", color = "black", shape = 21,
+                  size = igraph::betweenness(net, directed = T)/17500) +
+  ggnetwork::theme_blank()
+airport_bet <- as.data.frame(igraph::betweenness(net, directed = T))
+names(airport_bet)[1] <- "betweeness"
+airport_bet$airport <- row.names(airport_bet)
+head(airport_bet[order(airport_bet$betweeness, decreasing = T),],5)
+
+# Edge Betweeness
+# ggraph(net) + 
+#   geom_edge_link(width = 0.05, color = "black", alpha = .3, 
+#                   arrow = grid::arrow(angle = 10,
+#                                       length = unit(0.08, "in"),
+#                                       type = "closed"),
+#                   start_cap = circle(2, 'mm'),
+#                   end_cap = circle(2, 'mm'),
+#                   aes(width = edge.betweenness(net, directed = T))) +
+#   scale_edge_width(range = c(0.1, 1000)) +
+#   geom_node_point(shape = 21, size = 0.5) + 
+#   ggnetwork::theme_blank() + theme(legend.position = "none")
+# 
+# airport_ebet <- edge.betweenness(net, directed = T)
+# names(airport_ebet)[1] <- "edge.betweeness"
+```
+
+# Structure
+
+## Assortativity
+
+Assortativity: is a measure of the tendency of nodes in a network to connect to other nodes that are similar or dissimilar to themselves in terms of certain characteristics or attributes.
+
+```{r}
+net_num <- graph_from_data_frame(new_edges, directed = T, vertices = new_nodes)
+
+assortativity(net_num, V(net_num)$Sum_Passengers, directed = T)
+
+assortativity(net_num, V(net_num)$Sum_Depart, directed = T)
+
+assortativity_degree(net_num, directed = T)
+
+# may be disassortative, but not significant, could be mixed
+```
+
+## Transitivity
+
+Transitivity: ratio of the number of triangles that a node is part of to the maximum possible number of triangles it could be part of.
+
+```{r}
+trans <- igraph::transitivity(new_net, type = "local", isolates = "zero")
+summary(trans)
+```
+
+## Efficiency
+
+Efficiency: The average path between a node's neighbors, shorter path -> more efficient, high value will be this node can go to other place 
+
+```{r}
+local_efficiency(new_net)
+average_local_efficiency(new_net)
+
+new_nodes$local_transitivity <- trans 
+new_nodes$local_efficientcy <- local_efficiency(new_net)
+
+## Sort the dataframe
+result1 <- sqldf("SELECT * FROM new_nodes ORDER BY local_efficientcy desc")
+result2 <- sqldf("SELECT * FROM new_nodes ORDER BY local_transitivity desc")
+```
+
+## Diameter
+```{r}
+farthest_vertices(new_net)
+```
+
+## Distance
+```{r}
+mean_distance(new_net)
+all_shortest_paths(new_net, from = "SBN", to  = "HNL")
+```
+
+## Triad
+```{r}
+sna::dyad.census(net_sna)
+sna::triad.census(net_sna)
+```
+
+# ERGM
+
+```{r}
+model_master <- ergm(net_sna ~ edges + 
+                 nodecov("Sum_Passengers_scale") +
+                 absdiff("Sum_Passengers_scale") + nodecov("Sum_Depart_scale") + absdiff("Sum_Depart_scale") + mutual) 
+summary(model_master)
+
+
+gof.model1_btergm <- btergm::gof(model_master, nsim = 100, # checking goodness of fit of model estimates against 100 simulated networks
+                                   statistics = c(esp, deg, odeg, ideg, geodesic, 
+                                                  triad.directed)) #picked these statistics
+plot(gof.model1_btergm)
+
+plogis(coef(model_master)[['edges']] + coef(model_master)[['nodecov.Sum_Passengers_scale']] + 
+         coef(model_master)[['absdiff.Sum_Passengers_scale']] + coef(model_master)[['nodecov.Sum_Depart_scale']] + coef(model_master)[['absdiff.Sum_Depart_scale']] + coef(model_master)[['mutual']])
+
+mcmc.diagnostics(model_master)
+
+
+Cug_Edges <- cug.test(net_sna, gtrans, cmode="edges")
+plot(Cug_Edges)
+```
+
+## Visualization for ERGM
+```{r}
+ergm1 <- simulate(model_master)
+ergm1_net <- ggraph(ergm1) +
+  geom_edge_link0(color = "black", alpha = 0.15) +
+  geom_node_point(fill = "#B0A498", color = "black", shape = 21) +
+  labs(title = "Simulation 1") +
+  ggnetwork::theme_blank() +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+ergm1_net
+```
+
+# Multilevel Model
+
+## Random intercept model
+
+```{r}
+# Correlation matrix
+flight_corr <- el2[,-c(1:3, 10)]
+flight_corr$Carrier_Country <- as.numeric(as.factor(flight_corr$Carrier_Country))
+flight_corr$from_region <- as.numeric(as.factor(flight_corr$from_region))
+flight_corr$to_region <- as.numeric(as.factor(flight_corr$to_region))
+flight_corr_table <- cor(flight_corr)
+
+
+ggcorrplot(flight_corr_table, method = c('square'), hc.order = TRUE, type = "lower", outline.color = 'white') +
+  theme_minimal() + 
+  labs(x = "", title = "Correlation Matrix", y = "") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank(), 
+        panel.background = element_blank(),
+        axis.text.x = element_text(angle = 90),
+        text = element_text(size = 15)) 
+```
+
+```{r}
+# Remove highly correlated variable: Seats, Departures, to_region
+mlm1 <- lmer(Passengers ~  Carrier_Country + 
+               Aircraft + Distance + (1 | from_region), 
+               data = el2, REML = T,
+               na.action = na.omit)
+summary(mlm1)
+
+performance::icc(mlm1)
+```
+
+```{r}
+el3 <- el2[el2$Carrier_Country=="USA",] # only focus on US carriers
+
+mlm2 <- lmer(Passengers ~  Carrier_USstate + 
+               Aircraft + Distance + (1 | from_region), 
+               data = el3, REML = T,
+               na.action = na.omit)
+summary(mlm2)
+
+performance::icc(mlm2)
+```
+
